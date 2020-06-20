@@ -1,0 +1,214 @@
+---
+title: "ChIPPeakAnno analysis"
+author: "Mikhail Dozmorov"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: no
+  html_document:
+    theme: cerulean
+    toc: yes
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Set up the environment
+library(knitr)
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=F, tidy=T, fig.keep='high', echo=F, dpi=100, warnings=F, message=F, comment=NA, warning=F, results='as.is', fig.width = 10, fig.height = 6) #out.width=700, 
+library(pander)
+panderOptions('table.split.table', Inf)
+set.seed(1)
+library(dplyr)
+options(stringsAsFactors = FALSE)
+```
+
+<!-- https://www.bioconductor.org/packages/release/bioc/vignettes/ChIPpeakAnno/inst/doc/pipeline.html -->
+
+# Libraries
+
+```{r libraries}
+library(ChIPpeakAnno)
+library(readr)
+library(enrichR)
+library(motifStack)
+```
+
+# Settings
+
+```{r settings}
+p_val_cutoff   <- 0.05 # Regular p-value cutoff
+p_adj_cutoff   <- 0.3 # FDR cutoff
+ntable         <- 15 # Number of genes to output in a DEG table
+
+# Input MACS2 data
+fileNameIn1  <- "04_MACS2-star/CTPB_vs_T1H3K27SH.bed_peaks.xls"
+# Output to save annotated peaks and KEGG enrichments
+fileNameOut1 <- "results/CTPB_vs_T1H3K27SH.xlsx"
+```
+
+# Prepare annotation data
+
+```{r}
+# Mutually exclusive selectors, which analysis should be run. Only one may be TRUE
+human_analysis <- TRUE
+mouse_analysis <- FALSE
+
+# Prepate gene annotations, remove non-canonical chromosome names
+if (human_analysis) {
+  library("TxDb.Hsapiens.UCSC.hg38.knownGene")
+  TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene
+  library(BSgenome.Hsapiens.UCSC.hg19)
+  genome=Hsapiens
+  library(EnsDb.Hsapiens.v86)
+  annoData <- toGRanges(EnsDb.Hsapiens.v86, feature = "gene")
+  library(org.Hs.eg.db)
+  OrgDb = "org.Hs.eg.db"; species = "hsa"
+  # gene_annotations <- grch38[ !(grepl("_", grch38$chr) | grepl("GL", grch38$chr)), c("ensgene", "symbol", "biotype", "description")]
+  # gene_annotations <- gene_annotations[ !duplicated(gene_annotations) & !is.na(gene_annotations$symbol) & gene_annotations$description != "", ]
+  KEGG <- "KEGG_2019_Human"
+  # # Gene length for TPM calculations
+  # gene_length <- data.frame(Geneid = grch38$ensgene, Length = grch38$end - grch38$start)
+}
+if (mouse_analysis) {
+  library("TxDb.Mmusculus.UCSC.mm10.knownGene")
+  TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene
+  library(EnsDb.Mmusculus.v79)
+  annoData <- toGRanges(EnsDb.Mmusculus.v79, feature = "gene")
+  library(org.Mm.eg.db)
+  OrgDb = "org.Mm.eg.db"; species = "mmu"
+  # gene_annotations <- grcm38[ !(grepl("_", grcm38$chr) | grepl("GL", grcm38$chr)), c("ensgene", "symbol", "biotype", "description")]
+  # gene_annotations <- gene_annotations[ !duplicated(gene_annotations) & !is.na(gene_annotations$symbol) & gene_annotations$description != "", ]
+  # KEGG <- "KEGG_2019_Mouse"
+  # # Gene length for TPM calculations
+  # gene_length <- data.frame(Geneid = grcm38$ensgene, Length = grcm38$end - grcm38$start)
+}
+```
+
+# Import data
+
+```{r}
+# Read MACS2 file skipping lines with comments and specifying column types
+# First column - chromosomes - should be a character even if numeric from Ensembl
+mtx <- read_tsv(fileNameIn1, skip = 29, col_types = c("ciiiinnnnc"))
+# Canonical chromosomes to keep, from Ensembl annotation
+chromosomes <- c(as.character(1:22), "MT", "X", "Y")
+mtx <- mtx[mtx$chr %in% chromosomes, ] # Subset
+# Append "chr" to numerical chromosomes from Ensembl
+mtx$chr <- sapply(mtx$chr, function(x) {if (x == "MT") {x <- "M"}; paste0("chr", x)}) %>% unname
+
+# Convert the data to GRanges
+peaks <- ChIPpeakAnno::toGRanges(as.data.frame(mtx), format = "MACS2")
+print(paste0("Total number of peaks: ", length(peaks)))
+# annoData[1:2]
+## keep the seqnames in the same style
+seqlevelsStyle(peaks) <- seqlevelsStyle(annoData)
+```
+
+# Visualize binding site distribution relative to Transcription Start Sites
+
+```{r}
+binOverFeature(peaks, annotationData=annoData,
+               radius=5000, nbins=20, FUN=length, errFun=0,
+               ylab="count", 
+               main="Distribution of aggregated peak numbers around TSS")
+```
+
+```{r}
+aCR<-assignChromosomeRegion(peaks, nucleotideLevel=FALSE, 
+                           precedence=c("Promoters", "immediateDownstream", 
+                                         "fiveUTRs", "threeUTRs", 
+                                         "Exons", "Introns"), 
+                           TxDb=TxDb)
+barplot(aCR$percentage, las=3)
+```
+
+# Annotate peaks by the nearest gene
+
+```{r}
+## do annotation by nearest TSS
+anno <- annotatePeakInBatch(peaks, AnnotationData=annoData)
+# anno[1:2]
+# A pie chart can be used to demonstrate the overlap features of the peaks.
+pie1(table(anno$insideFeature))
+
+anno <- addGeneIDs(anno, orgAnn=OrgDb, 
+                   feature_id_type="ensembl_gene_id",
+                   IDs2Add=c("symbol"))
+```
+
+Top `r ntable` most frequent genes
+
+```{r}
+anno$symbol[!is.na(anno$symbol)] %>% table %>% sort %>% tail(., n = ntable) %>% rev %>% kable
+```
+
+
+# KEGG pathway enrichment analysis
+
+```{r}
+genes <- unique(anno$symbol[!is.na(anno$symbol)])
+res.kegg <- enrichr(genes, databases = KEGG) # KEGG results only
+      # If significant results are present, save them
+      if(nrow(res.kegg[[KEGG]]) > 0 & sum(res.kegg[[KEGG]]$Adjusted.P.value < p_adj_cutoff) > 0) {
+        res.kegg <- as.data.frame(res.kegg[[KEGG]])
+        res.kegg <- res.kegg[res.kegg$Adjusted.P.value < p_adj_cutoff, , drop = FALSE]
+      }
+```
+
+A total of `r nrow(res.kegg)` KEGG pathways were detected as significantly affected at FDR `r p_adj_cutoff`. Top `r ntable` shown. If nothing is shown, nothing is significant.
+
+```{r}
+# Display the results
+# DT::datatable(res.kegg)
+if (class(res.kegg) == "data.frame") {
+  kable(res.kegg[1:min(ntable, nrow(res.kegg)), , drop = FALSE])
+}
+```
+
+# Output a summary of consensus sequences in the peaks
+
+```{r}
+# Get sequences around all peaks
+seq <- getAllPeakSequence(peaks, upstream=20, downstream=20, genome=Hsapiens)
+# Remove strings with N and those with NAs
+seq <- seq[!(grepl("N", seq$sequence) | is.na(seq$sequence)) ]
+
+## summary of the short oligos
+freqs <- oligoFrequency(Hsapiens$chr1, MarkovOrder=3)
+os <- oligoSummary(seq, oligoLength=6, MarkovOrder=3, quickMotif=TRUE, freqs=freqs)
+## plot the results
+zscore <- sort(os$zscore)
+h <- hist(zscore, breaks=100, xlim=c(-50, 50), main="Histogram of Z-score")
+text(zscore[length(zscore)], max(h$counts)/10, labels=names(zscore[length(zscore)]), adj=1)
+```
+
+Visualizing up to top 5 motifs, if any
+
+```{r}
+## generate the motifs
+pfms <- mapply(function(.ele, id)
+    new("pfm", mat=.ele, name=paste("SAMPLE motif", id)), 
+    os$motifs, 1:length(os$motifs))
+print(paste0("Total number of motifs: ", length(pfms)))
+
+# Decide how many to plot, if any
+if(length(pfms) > 0) {
+  if (length(pfms) > 5) {
+    pfms <- pfms[1:5]
+  }
+  motifStack(pfms)
+}
+```
+
+# Save the results
+
+```{r}
+if (class(res.kegg) == "data.frame") {
+  x <- list(as.data.frame(anno), res.kegg)
+  names(x) <- c("Peaks", "KEGG")
+} else {
+  x <- list(as.data.frame(anno))
+  names(x) <- c("Peaks")
+}
+writexl::write_xlsx(x, path = fileNameOut1)
+```
+
